@@ -1,152 +1,248 @@
 const express = require("express");
+const mongoose = require("mongoose");
+const nodemailer = require("nodemailer");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
-const nodemailer = require("nodemailer");
-const User = require("../models/User");
-
+const { User } = require("../models/User");
+require("dotenv").config();
 const router = express.Router();
 
-// Send OTP to Email
-const sendEmail = async (email, otp) => {
-  const transporter = nodemailer.createTransport({
-    service: "gmail",
-    auth: {
-      user: process.env.EMAIL,
-      pass: process.env.EMAIL_PASSWORD,
-    },
-  });
-
-  const mailOptions = {
-    from: process.env.EMAIL,
-    to: email,
-    subject: "OTP for Account Verification",
-    text: `Your OTP is ${otp}`,
-  };
-
-  try {
-    await transporter.sendMail(mailOptions);
-  } catch (error) {
-    console.error("Error sending email:", error);
-    throw new Error("Failed to send OTP");
+// Generate a random string for OTP
+const generateOTP = () => {
+  const characters = "0123456789";
+  let otp = "";
+  for (let i = 0; i < 6; i++) {
+    otp += characters[Math.floor(Math.random() * characters.length)];
   }
+  return otp;
 };
 
-// Register User
+// Generate a unique token for OTP verification
+const generateVerificationToken = () => {
+  return (
+    Math.random().toString(36).substring(2, 15) +
+    Math.random().toString(36).substring(2, 15)
+  );
+};
+
+// Setup Nodemailer transporter
+const transporter = nodemailer.createTransport({
+  service: "gmail",
+  auth: {
+    user: process.env.EMAIL_USERNAME,
+    pass: process.env.EMAIL_PASSWORD,
+  },
+});
+// Store OTP and verification token in memory (for demonstration purposes)
+const otpCache = new Map();
+
+// API endpoint for sending OTP to user's email
+router.post("/send-otp", async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    // Generate and save unique verification token
+    const verificationToken = generateVerificationToken();
+
+    // Generate and save OTP
+    const otp = generateOTP();
+    const otpExpiresAt = new Date(Date.now() + 10 * 60 * 1000); // OTP expires in 10 minutes
+
+    // Save OTP and verification token in the database (for future verification during signup)
+    // Save OTP and verification token in memory
+    otpCache.set(email, { otp, verificationToken });
+
+    // Send email with OTP and verification token
+    const mailOptions = {
+      from: process.env.EMAIL_USERNAME,
+      to: email,
+      subject: "UserAuth - OTP Verification",
+      html: `
+        <div style="font-family: Arial, sans-serif; background-color: #f2f2f2; padding: 20px; text-align: center;">
+          <h2 style="color: #866118;">UserAuth- OTP Verification</h2>
+          <p style="font-size: 16px;">Your OTP for UserAuth is: <strong>${otp}</strong>. It will expire in 10 minutes.</p>
+          <p style="font-size: 14px; color: #666;">This is an automated email, please do not reply.</p>
+          <div style="margin-top: 20px; padding: 10px; background-color: #fff; border: 1px solid #ddd; border-radius: 5px;">
+            <p style="font-size: 14px; color: #555;">For any questions or concerns, please contact our support team.</p>
+            <a href="mailto:support@userauth.com" style="text-decoration: none; color: #866118; font-weight: bold;">Contact Support</a>
+          </div>
+        </div>
+      `,
+    };
+
+    await transporter.sendMail(mailOptions);
+
+    res
+      .status(200)
+      .json({ message: "OTP sent successfully. Check your email." });
+    // console.log(otp, otpExpiresAt, verificationToken);
+  } catch (error) {
+    console.error("Error during OTP sending:", error);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+// API endpoint for user signup with OTP verification
 router.post("/register", async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const {
+      email,
+      verificationText,
+      firstName,
+      lastName,
+      password /* other user info */,
+    } = req.body;
 
-    // Check if user already exists
-    let user = await User.findOne({ email });
-    if (user) {
-      return res.status(400).json({ msg: "User already exists" });
+    // Log request details for debugging
+    // console.log("Request received:", req.body);
+
+    // Check if the provided email exists in the OTP cache
+    const storedOtpData = otpCache.get(email);
+
+    if (!storedOtpData) {
+      // User not found in the cache, indicating verification failure
+      return res.status(401).json({
+        error: "Incorrect OTP or OTP expired. Please try again.",
+      });
     }
 
-    // Create OTP
-    const otp = Math.floor(1000 + Math.random() * 9000);
+    const { otp, verificationToken } = storedOtpData;
 
-    await sendEmail(email, otp);
+    // Check if the provided OTP and verification token match the stored data
+    if (verificationText !== otp) {
+      return res.status(401).json({
+        error: "Incorrect OTP. Please try again.",
+      });
+    }
 
-    // Hash password
-    const salt = await bcrypt.genSalt(10);
-    const hashedPassword = await bcrypt.hash(password, salt);
-
-    // Create new user
-    user = new User({
-      email,
-      password: hashedPassword,
-      otp,
+    // Correct OTP
+    // Save user information to the database
+    const newUser = new User({
+      userInformation: {
+        email,
+        firstName,
+        lastName,
+        password,
+        isVerified: true, // Set the user as verified
+      },
+      verificationInformation: {
+        otp: null, // Set OTP to null after successful verification if needed
+        otpExpiresAt: null, // Set OTP expiration to null after successful verification if needed
+        verificationToken: null, // Set verification token to null after successful verification
+      },
     });
 
-    await user.save();
+    await newUser.save();
 
-    res.status(200).json({ msg: "User registered successfully" });
-  } catch (err) {
-    console.error(err.message);
-    res.status(500).json({ msg: err.message });
+    // Generate JWT token (optional)
+    const token = jwt.sign({ userId: newUser._id }, process.env.JWT_SECRET, {
+      expiresIn: "24d",
+    });
+
+    res.status(201).json({ message: "Signup successful. Welcome!", token });
+  } catch (error) {
+    console.error("Error during signup:", error);
+    res.status(500).json({ error: "Internal Server Error" });
   }
 });
 
-// Validate OTP
-router.post("/validate-otp", async (req, res) => {
-  try {
-    const { email, otp } = req.body;
-
-    const user = await User.findOne({ email });
-
-    if (!user || user.otp !== otp) {
-      return res.status(400).json({ msg: "Invalid OTP" });
-    }
-
-    user.isVerified = true;
-    await user.save();
-
-    res.status(200).json({ msg: "Account verified successfully" });
-  } catch (err) {
-    console.error(err.message);
-    res.status(500).json({ msg: err.message });
-  }
-});
-
-// Login User
 router.post("/login", async (req, res) => {
   try {
     const { email, password } = req.body;
 
-    const user = await User.findOne({ email });
+    // Find the user by email
+    const user = await User.findOne({
+      "userInformation.email": email,
+    });
 
-    if (!user || !user.isVerified) {
-      return res.status(400).json({ msg: "Invalid credentials" });
+    // If user not found, return an error
+    if (!user) {
+      return res.status(401).json({ error: "Invalid email or password" });
     }
 
-    const isMatch = await bcrypt.compare(password, user.password);
+    // Compare the provided password with the hashed password using the comparePassword method
+    const isPasswordValid = await user.comparePassword(password);
 
-    if (!isMatch) {
-      return res.status(400).json({ msg: "Invalid credentials" });
+    // If the password is invalid, return an error
+    if (!isPasswordValid) {
+      return res.status(401).json({ error: "Invalid email or password" });
     }
 
-    const payload = {
-      user: {
-        id: user.id,
-      },
-    };
+    // Generate JWT token
+    const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET, {
+      expiresIn: "1h",
+    });
 
-    jwt.sign(
-      payload,
-      process.env.JWT_SECRET,
-      { expiresIn: "1h" },
-      (err, token) => {
-        if (err) throw err;
-        res.status(200).json({ token });
-      }
-    );
-  } catch (err) {
-    console.error(err.message);
-    res.status(500).json({ msg: err.message });
+    // Return success message and token
+    res.status(200).json({ message: "Login successful", token });
+  } catch (error) {
+    console.error("Error during login:", error);
+    res.status(500).json({ error: "Internal Server Error" });
   }
 });
 
-// Get User Info
+// API endpoint for getting user data
 router.get("/user", async (req, res) => {
+  // console.log("Endpoint: /user");
   try {
-    const token = req.header("x-auth-token");
+    // Extract the JWT token from the request headers
+    const token = req.headers.authorization?.split(" ")[1];
+    // console.log("Received token:", token);
 
     if (!token) {
-      return res.status(401).json({ msg: "No token, authorization denied" });
+      console.log("No token provided");
+      return res.status(401).json({ error: "Unauthorized" });
     }
 
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    // Use the actual secret key from environment variables
+    const secretKey = process.env.JWT_SECRET;
 
-    const user = await User.findById(decoded.user.id).select("-password");
-
-    if (!user) {
-      return res.status(404).json({ msg: "User not found" });
+    if (!secretKey) {
+      console.error("JWT secret key not provided");
+      return res.status(500).json({ error: "Internal Server Error" });
     }
 
-    res.status(200).json(user);
-  } catch (err) {
-    console.error(err.message);
-    res.status(500).json({ msg: err.message });
+    try {
+      const decoded = jwt.verify(token, secretKey);
+      // console.log("Decoded payload with actual secret key:", decoded);
+
+      // Check if the token is expired
+      const currentTime = Math.floor(Date.now() / 1000);
+      if (decoded.exp < currentTime) {
+        console.log("Token expired");
+        return res.status(401).json({ error: "Token expired" });
+      }
+
+      // Find the user by ID
+      const user = await User.findById(decoded.userId);
+
+      // If user not found, return an error
+      if (!user) {
+        console.log("User not found");
+        return res.status(404).json({ error: "User not found" });
+      }
+
+      // Return the user data without the password field
+      const userData = {
+        _id: user._id,
+        email: user.userInformation.email,
+        firstName: user.userInformation.firstName,
+        lastName: user.userInformation.lastName,
+        isVerified: user.userInformation.isVerified,
+        organizationInformation: user.organizationInformation,
+      };
+
+      // console.log("User data:", userData);
+
+      // Return the user data
+      res.status(200).json(userData);
+    } catch (error) {
+      console.error("Error verifying token with actual secret key:", error);
+      res.status(401).json({ error: "Invalid token" });
+    }
+  } catch (error) {
+    console.error("Error getting user data:", error);
+    res.status(500).json({ error: "Internal Server Error" });
   }
 });
 
